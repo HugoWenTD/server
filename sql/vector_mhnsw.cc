@@ -15,6 +15,12 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA
 */
 
+#ifndef __STDC_WANT_IEC_60559_TYPES_EXT__
+#define __STDC_WANT_IEC_60559_TYPES_EXT__
+// support for _Float16, gcc 12+
+#endif
+#include <float.h>
+
 #include <my_global.h>
 #include "vector_mhnsw.h"
 
@@ -27,23 +33,45 @@
 #include "mysql/psi/psi_base.h"
 #include "sql_queue.h"
 #include <scope.h>
+#include "log.h"
 
+#ifdef __FLT16_MAX__
+#define HALF_FLOAT_SUPPORT
+#define half_float _Float16
+#endif
+
+#ifdef HALF_FLOAT_SUPPORT
+#define idx_float half_float
+#define clo_nei_size 2
+#define clo_nei_store float2store
+#define clo_nei_read  float2get
+#else
+#define idx_float float
 #define clo_nei_size 4
 #define clo_nei_store float4store
 #define clo_nei_read  float4get
+#endif
+
+#define bin_float float
+
+// size of float from source vector binary
+#define bin_float_size sizeof(bin_float)
+#define idx_float_size sizeof(idx_float)
+
 
 // Algorithm parameters
 // best by test (fastest construction with recall > 99% for ef=20, limit=10)
 // for random-xs-20-euclidean (9000) [ 3, 1.1, M=7 ]
 // for mnist-784-euclidean   (60000) [ 4, 1.1, M=13 ]
 // for sift-128-euclidean  (1000000) [ 4, 1.1, M>64 ] (98% with M=64)
-static const double ef_construction_multiplier = 4;
+//TODO:revert
+static const double ef_construction_multiplier = 1;
 static const double alpha = 1.1;
 static const uint clo_nei_threshold= 10000;
 
 // SIMD definitions
 #define SIMD_word   (256/8)
-#define SIMD_floats (SIMD_word/sizeof(float))
+#define SIMD_floats (SIMD_word/sizeof(idx_float))
 // how many extra bytes we need to alloc to be able to convert
 // sizeof(double) aligned memory to SIMD_word aligned
 #define SIMD_margin (SIMD_word - sizeof(double))
@@ -59,10 +87,11 @@ class FVector: public Sql_alloc
 public:
   MHNSW_Context *ctx;
   FVector(MHNSW_Context *ctx_, const void *vec_);
-  float *vec;
+  idx_float *vec;
 protected:
   FVector(MHNSW_Context *ctx_) : ctx(ctx_), vec(nullptr) {}
-  void make_vec(const void *vec_);
+  void make_vec(const void *vec_); // convert to idx_float vector from src binary
+  void load_vec(const void *vec_); // load idx_float vector from index
 };
 
 class FVectorNode: public FVector
@@ -70,7 +99,7 @@ class FVectorNode: public FVector
 private:
   uchar *tref, *gref;
   size_t max_layer;
-  mutable float cached_distance;
+  mutable idx_float cached_distance;
   mutable const FVector *cached_other= nullptr;
   mutable ulonglong visited= 0;
 
@@ -79,12 +108,12 @@ private:
   int alloc_neighborhood(size_t layer);
 public:
   List<FVectorNode> *neighbors= nullptr;
-  float *closest_neighbor= 0;
+  idx_float *closest_neighbor= 0;
 
   FVectorNode(MHNSW_Context *ctx_, const void *gref_);
   FVectorNode(MHNSW_Context *ctx_, const void *tref_, size_t layer,
               const void *vec_);
-  float distance_to(const FVector &other) const;
+  idx_float distance_to(const FVector &other) const;
   int load();
   int load_from_record();
   int save();
@@ -92,7 +121,7 @@ public:
   uchar *get_tref() const { return tref; }
   size_t get_gref_len() const;
   uchar *get_gref() const { return gref; }
-  void update_closest_neighbor(size_t layer, float dist, const FVectorNode &v);
+  void update_closest_neighbor(size_t layer, idx_float dist, const FVectorNode &v);
   bool is_visited() const;
 
   static uchar *get_key(const FVectorNode *elem, size_t *key_len, my_bool);
@@ -110,8 +139,8 @@ class MHNSW_Context
   MEM_ROOT root;
   TABLE *table;
   Field *vec_field;
-  size_t vec_len= 0;
-  size_t byte_len= 0;
+  size_t vec_len= 0; //Vector size + SIMD alignment padding
+  size_t byte_len= 0; //hnsw vector length in bytes
   ulonglong visited= 0;
   uint err= 0;
 
@@ -132,7 +161,7 @@ class MHNSW_Context
   void set_lengths(size_t len)
   {
     byte_len= len;
-    vec_len= MY_ALIGN(byte_len/sizeof(float), SIMD_floats);
+    vec_len= MY_ALIGN(byte_len/sizeof(idx_float), SIMD_floats);
   }
 };
 
@@ -143,13 +172,34 @@ FVector::FVector(MHNSW_Context *ctx_, const void *vec_) : ctx(ctx_)
 
 void FVector::make_vec(const void *vec_)
 {
+  if (bin_float_size == idx_float_size)
+    load_vec(vec_);
+
+  // convert to idx_float
   DBUG_ASSERT(ctx->vec_len);
-  vec= (float*)alloc_root(&ctx->root,
-                          ctx->vec_len * sizeof(float) + SIMD_margin);
+  vec= (idx_float*)alloc_root(&ctx->root,
+                              ctx->vec_len * sizeof(idx_float) + SIMD_margin);
   if (int off= ((intptr)vec) % SIMD_word)
-    vec += (SIMD_word - off) / sizeof(float);
+    vec += (SIMD_word - off) / sizeof(idx_float);
+
+  for (size_t i= 0; i < ctx->byte_len/sizeof(idx_float); i++)
+    vec[i] = (idx_float)*((bin_float*)vec_ + i);
+  //memcpy(vec, vec_, ctx->byte_len);
+
+  for (size_t i=ctx->byte_len/sizeof(idx_float); i < ctx->vec_len; i++)
+    vec[i]=0;
+}
+
+void FVector::load_vec(const void *vec_)
+{
+  DBUG_ASSERT(ctx->vec_len);
+  vec= (idx_float*)alloc_root(&ctx->root,
+                           ctx->vec_len * sizeof(idx_float) + SIMD_margin);
+  if (int off= ((intptr)vec) % SIMD_word)
+    vec += (SIMD_word - off) / sizeof(idx_float);
+
   memcpy(vec, vec_, ctx->byte_len);
-  for (size_t i=ctx->byte_len/sizeof(float); i < ctx->vec_len; i++)
+  for (size_t i=ctx->byte_len/sizeof(idx_float); i < ctx->vec_len; i++)
     vec[i]=0;
 }
 
@@ -170,16 +220,16 @@ FVectorNode::FVectorNode(MHNSW_Context *ctx_, const void *tref_, size_t layer,
     closest_neighbor[i]= FLT_MAX;
 }
 
-float FVectorNode::distance_to(const FVector &other) const
+idx_float FVectorNode::distance_to(const FVector &other) const
 {
   if (cached_other != &other)
   {
     const_cast<FVectorNode*>(this)->load();
 #if __GNUC__ > 7
-    typedef float v8f __attribute__((vector_size(SIMD_word)));
+    typedef idx_float v8f __attribute__((vector_size(SIMD_word)));
     v8f *p1= (v8f*)vec;
     v8f *p2= (v8f*)other.vec;
-    v8f d= {0,0,0,0,0,0,0,0};
+    v8f d= {0};
     for (size_t i= 0; i < ctx->vec_len/SIMD_floats; p1++, p2++, i++)
     {
       v8f dist= *p1 - *p2;
@@ -194,6 +244,8 @@ float FVectorNode::distance_to(const FVector &other) const
 #endif
     cached_other= &other;
   }
+  // sql_print_information( "distance:%f\n", cached_distance);
+
   return cached_distance;
 }
 
@@ -202,7 +254,8 @@ int FVectorNode::alloc_neighborhood(size_t layer)
   DBUG_ASSERT(!neighbors);
   max_layer= layer;
   neighbors= new (&ctx->root) List<FVectorNode>[layer+1];
-  closest_neighbor= (float*)alloc_root(&ctx->root, (layer+1)*sizeof(*closest_neighbor));
+  closest_neighbor= (idx_float*)alloc_root(&ctx->root,
+                                        (layer+1)*sizeof(*closest_neighbor));
   memset(closest_neighbor, 0xff, (layer+1)*sizeof(*closest_neighbor)); // NaN
   return 0;
 }
@@ -239,7 +292,7 @@ int FVectorNode::load_from_record()
   DBUG_ASSERT(ctx->byte_len);
   if (v->length() != ctx->byte_len)
     return ctx->err= HA_ERR_CRASHED;
-  make_vec(v->ptr());
+  load_vec(v->ptr());
 
   size_t layer= graph->field[FIELD_LAYER]->val_int();
   if (layer > 100) // 10e30 nodes at M=2, more at larger M's
@@ -268,7 +321,7 @@ int FVectorNode::load_from_record()
   return 0;
 }
 
-void FVectorNode::update_closest_neighbor(size_t layer, float dist,
+void FVectorNode::update_closest_neighbor(size_t layer, idx_float dist,
                                           const FVectorNode &other)
 {
   if (memcmp(gref, other.get_gref(), get_gref_len()) < 0 &&
@@ -313,8 +366,8 @@ FVectorNode *MHNSW_Context::get_node(const void *gref)
 
 static int cmp_vec(const FVector *target, const FVectorNode *a, const FVectorNode *b)
 {
-  float a_dist= a->distance_to(*target);
-  float b_dist= b->distance_to(*target);
+  idx_float a_dist= a->distance_to(*target);
+  idx_float b_dist= b->distance_to(*target);
 
   if (a_dist < b_dist)
     return -1;
@@ -356,8 +409,8 @@ static int select_neighbors(MHNSW_Context *ctx, size_t layer,
   while (pq.elements() && neighbors.elements < max_neighbor_connections)
   {
     const FVectorNode *vec= pq.pop();
-    const float target_dist= vec->distance_to(target);
-    const float target_dista= target_dist / alpha;
+    const idx_float target_dist= vec->distance_to(target);
+    const idx_float target_dista= target_dist / alpha;
     bool discard= false;
     if (do_cn)
       discard= vec->closest_neighbor[layer] < target_dista;
@@ -508,13 +561,13 @@ static int search_layer(MHNSW_Context *ctx, const FVector &target,
   }
 
   // edge case: all start_nodes are deleted, so best is empty
-  float furthest_best= best.elements() > 0 ?
-                       best.top()->distance_to(target) : FLT_MAX;
+  idx_float furthest_best= best.elements() > 0 ?
+                        best.top()->distance_to(target) : FLT_MAX;
 
   while (candidates.elements())
   {
     const FVectorNode &cur_vec= *candidates.pop();
-    float cur_distance= cur_vec.distance_to(target);
+    idx_float cur_distance= cur_vec.distance_to(target);
     if (cur_distance > furthest_best && best.elements() == max_candidates_return)
     {
       break; // All possible candidates are worse than what we have.
@@ -586,7 +639,7 @@ int mhnsw_insert(TABLE *table, KEY *keyinfo)
   // but in MyISAM the row will stay inserted, making the index out of sync:
   // invalid vector values are present in the table but cannot be found
   // via an index. The easiest way to fix it is with a VECTOR(N) type
-  if (res->length() == 0 || res->length() % 4)
+  if (res->length() == 0 || res->length() % bin_float_size)
     return bad_value_on_insert(vec_field);
 
   const double NORMALIZATION_FACTOR= 1 / std::log(thd->variables.mhnsw_max_edges_per_node);
@@ -611,7 +664,7 @@ int mhnsw_insert(TABLE *table, KEY *keyinfo)
     ctx.err= 0;
 
     // First insert!
-    ctx.set_lengths(res->length());
+    ctx.set_lengths(res->length() / bin_float_size * idx_float_size);
     FVectorNode target(&ctx, table->file->ref, 0, res->ptr());
     return target.save();
   }
@@ -631,7 +684,7 @@ int mhnsw_insert(TABLE *table, KEY *keyinfo)
   if (int err= start_node->load_from_record())
     return err;
 
-  if (ctx.byte_len != res->length())
+  if (ctx.byte_len / idx_float_size != res->length() / bin_float_size)
     return bad_value_on_insert(vec_field);
 
   if (int err= graph->file->ha_rnd_init(0))
@@ -733,7 +786,7 @@ int mhnsw_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
     NULL, so the result is basically unsorted, we can return rows
     in any order. For simplicity let's sort by the start_node.
   */
-  if (!res || ctx.byte_len != res->length())
+  if (!res || ctx.byte_len != res->length() / bin_float_size * idx_float_size)
     (res= &buf)->set((char*)start_node->vec, ctx.byte_len, &my_charset_bin);
 
   if (int err= graph->file->ha_rnd_init(0))
@@ -805,7 +858,7 @@ int mhnsw_invalidate(TABLE *table, uchar *rec, KEY *keyinfo)
   DBUG_ASSERT(h->ref_length <= graph->field[1]->field_length);
   DBUG_ASSERT(h->ref_length <= graph->field[2]->field_length);
 
-  if (res->length() == 0 || res->length() % 4)
+  if (res->length() == 0 || res->length() % bin_float_size)
     return 1;
 
   // use index on tref

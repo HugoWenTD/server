@@ -18,6 +18,8 @@
 */
 
 #ifndef MY_BYTE_ORDER_ARCH_OPTIMIZED
+#define float2get(V,M)   memcpy(&V, (M), 2)
+#define float2store(V,M) memcpy(V, (&M), 2)
 #define float4get(V,M)   memcpy(&V, (M), sizeof(float))
 #define float4store(V,M) memcpy(V, (&M), sizeof(float))
 #define float8get(V,M)   doubleget((V),(M))

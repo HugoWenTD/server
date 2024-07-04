@@ -52,14 +52,15 @@ double Item_func_vec_distance::val_real()
   return euclidean_vec_distance(v1, v2, (r1->length()) / sizeof(float));
 }
 
-double euclidean_vec_distance(float *v1, float *v2, size_t v_len)
+template <typename T>
+double euclidean_vec_distance(const T *v1, const T *v2, size_t v_len)
 {
-  float *p1= v1;
-  float *p2= v2;
+  const T *p1= v1;
+  const T *p2= v2;
   double d= 0;
   for (size_t i= 0; i < v_len; p1++, p2++, i++)
   {
-    float dist= *p1 - *p2;
+    const T dist= *p1 - *p2;
     d+= dist * dist;
   }
   return d;

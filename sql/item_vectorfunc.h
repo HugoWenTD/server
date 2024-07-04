@@ -59,6 +59,7 @@ public:
   { return get_item_copy<Item_func_vec_distance>(thd, this); }
 };
 
+template <typename T>
+double euclidean_vec_distance(const T *v1, const T *v2, size_t v_len);
 
-double euclidean_vec_distance(float *v1, float *v2, size_t v_len);
 #endif

@@ -16,6 +16,15 @@
 /*
   Data in big-endian format.
 */
+
+#define float2store(T,A) do { *(T)= ((uchar *) &A)[1];\
+                              *((T)+1)=(char) ((uchar *) &A)[0]; } while(0)
+
+#define float2get(V,M)   do { float def_temp;\
+                              ((uchar*) &def_temp)[0]=(M)[1];\
+                              ((uchar*) &def_temp)[1]=(M)[0];\
+                              (V)=def_temp; } while(0)
+
 #define float4store(T,A) do { *(T)= ((uchar *) &A)[3];\
                               *((T)+1)=(char) ((uchar *) &A)[2];\
                               *((T)+2)=(char) ((uchar *) &A)[1];\
